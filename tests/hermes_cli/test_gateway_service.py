@@ -678,6 +678,38 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
+    def test_read_launchd_service_falls_back_to_domain_print(self, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd == ["launchctl", "list", "ai.hermes.gateway"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="pid = 64543\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+
+        assert gateway_cli._read_launchd_service("ai.hermes.gateway") == (
+            True,
+            "pid = 64543\n",
+        )
+        assert calls == [
+            ["launchctl", "list", "ai.hermes.gateway"],
+            ["launchctl", "print", "gui/501/ai.hermes.gateway"],
+        ]
+
+    def test_get_service_pids_parses_launchd_print_output(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_launchd_service",
+            lambda label: (True, "state = running\n\tpid = 64543\n"),
+        )
+
+        assert gateway_cli._get_service_pids() == {64543}
+
 
 class TestGatewayServiceDetection:
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):

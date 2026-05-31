@@ -382,6 +382,14 @@ class SessionDB:
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
+    # Errors that can describe a poisoned long-lived SQLite handle while a
+    # freshly opened connection to the same on-disk DB is still healthy.
+    _RECONNECTABLE_DATABASE_ERROR_MARKERS = (
+        "database disk image is malformed",
+        "database schema has changed",
+        "file is not a database",
+        "cannot operate on a closed database",
+    )
 
     def __init__(self, db_path: Path = None):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -392,22 +400,7 @@ class SessionDB:
         self._fts_enabled = False
         self._fts_unavailable_warned = False
         try:
-            self._conn = sqlite3.connect(
-                str(self.db_path),
-                check_same_thread=False,
-                # Short timeout — application-level retry with random jitter
-                # handles contention instead of sitting in SQLite's internal
-                # busy handler for up to 30s.
-                timeout=1.0,
-                # auto-starts transactions on DML, which conflicts with our
-                # explicit BEGIN IMMEDIATE.  None = we manage transactions
-                # ourselves.
-                isolation_level=None,
-            )
-            self._conn.row_factory = sqlite3.Row
-            apply_wal_with_fallback(self._conn, db_label="state.db")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-
+            self._conn = self._open_connection()
             self._init_schema()
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
@@ -424,6 +417,81 @@ class SessionDB:
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    def _open_connection(self) -> sqlite3.Connection:
+        """Open and configure one SQLite connection."""
+        conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            # Short timeout — application-level retry with random jitter
+            # handles contention instead of sitting in SQLite's internal
+            # busy handler for up to 30s.
+            timeout=1.0,
+            # Autocommit mode: Python's default isolation_level=""
+            # auto-starts transactions on DML, which conflicts with our
+            # explicit BEGIN IMMEDIATE.  None = we manage transactions
+            # ourselves.
+            isolation_level=None,
+        )
+        try:
+            conn.row_factory = sqlite3.Row
+            apply_wal_with_fallback(conn, db_label="state.db")
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+        except Exception:
+            conn.close()
+            raise
+
+    @classmethod
+    def _is_reconnectable_database_error(cls, exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(
+            marker in msg for marker in cls._RECONNECTABLE_DATABASE_ERROR_MARKERS
+        )
+
+    def _reconnect_locked(self, cause: Exception) -> None:
+        """Replace a poisoned SQLite handle while holding ``self._lock``."""
+        old_conn = self._conn
+        self._conn = None
+        if old_conn is not None:
+            try:
+                old_conn.close()
+            except Exception:
+                pass
+
+        try:
+            self._conn = self._open_connection()
+            self._init_schema()
+        except Exception:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+            raise
+
+        logger.warning(
+            "Reopened SQLite connection after runtime database error: %s", cause
+        )
+
+    def reconnect(self, cause: Exception) -> None:
+        """Replace the current SQLite handle after a runtime connection error."""
+        with self._lock:
+            self._reconnect_locked(cause)
+
+    def _execute_read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Execute a read, reopening a poisoned long-lived handle once."""
+        for attempt in range(2):
+            try:
+                with self._lock:
+                    return fn(self._conn)
+            except sqlite3.DatabaseError as exc:
+                if attempt == 0 and self._is_reconnectable_database_error(exc):
+                    self.reconnect(exc)
+                    continue
+                raise
+        raise AssertionError("unreachable")
 
     # ── Core write helper ──
 
@@ -548,10 +616,13 @@ class SessionDB:
         Returns whatever *fn* returns.
         """
         last_err: Optional[Exception] = None
+        reconnected = False
         for attempt in range(self._WRITE_MAX_RETRIES):
+            transaction_started = False
             try:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
+                    transaction_started = True
                     try:
                         result = fn(self._conn)
                         self._conn.commit()
@@ -566,9 +637,11 @@ class SessionDB:
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
                 return result
-            except sqlite3.OperationalError as exc:
+            except sqlite3.DatabaseError as exc:
                 err_msg = str(exc).lower()
-                if "locked" in err_msg or "busy" in err_msg:
+                if isinstance(exc, sqlite3.OperationalError) and (
+                    "locked" in err_msg or "busy" in err_msg
+                ):
                     last_err = exc
                     if attempt < self._WRITE_MAX_RETRIES - 1:
                         jitter = random.uniform(
@@ -576,6 +649,14 @@ class SessionDB:
                             self._WRITE_RETRY_MAX_S,
                         )
                         time.sleep(jitter)
+                        continue
+                if (
+                    not reconnected
+                    and self._is_reconnectable_database_error(exc)
+                ):
+                    self.reconnect(exc)
+                    reconnected = True
+                    if not transaction_started:
                         continue
                 # Non-lock error or retries exhausted — propagate.
                 raise
@@ -1956,12 +2037,12 @@ class SessionDB:
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by insertion order."""
-        with self._lock:
-            cursor = self._conn.execute(
+        rows = self._execute_read(
+            lambda conn: conn.execute(
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
                 (session_id,),
-            )
-            rows = cursor.fetchall()
+            ).fetchall()
+        )
         result = []
         for row in rows:
             msg = dict(row)
@@ -2250,16 +2331,16 @@ class SessionDB:
         if include_ancestors:
             session_ids = self._session_lineage_root_to_tip(session_id)
 
-        with self._lock:
-            placeholders = ",".join("?" for _ in session_ids)
-            rows = self._conn.execute(
+        placeholders = ",".join("?" for _ in session_ids)
+        rows = self._execute_read(
+            lambda conn: conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed "
                 f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
-
+        )
         messages = []
         for row in rows:
             content = self._decode_content(row["content"])

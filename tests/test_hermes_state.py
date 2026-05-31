@@ -50,6 +50,25 @@ class _NoFtsExistingTableConnection(sqlite3.Connection):
         return super().cursor(factory or _NoFtsExistingTableCursor)
 
 
+class _FailingConnection:
+    """Proxy one SQLite connection and inject one runtime database failure."""
+
+    def __init__(self, conn, *, fail_sql=None):
+        self._conn = conn
+        self._fail_sql = fail_sql
+        self._failed = False
+
+    def execute(self, sql, *args, **kwargs):
+        should_fail = self._fail_sql is None or self._fail_sql in sql
+        if should_fail and not self._failed:
+            self._failed = True
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 @pytest.fixture()
 def db(tmp_path):
     """Create a SessionDB with a temp database file."""
@@ -62,6 +81,37 @@ def db(tmp_path):
 # =========================================================================
 # Session lifecycle
 # =========================================================================
+
+class TestRuntimeConnectionRecovery:
+    def test_conversation_read_reopens_poisoned_connection(self, db):
+        db.create_session("s1", "telegram")
+        db.append_message("s1", "user", "hello")
+        db._conn = _FailingConnection(db._conn)
+
+        assert db.get_messages_as_conversation("s1") == [
+            {"role": "user", "content": "hello"}
+        ]
+
+    def test_write_retries_when_begin_fails_before_transaction_starts(self, db):
+        db._conn = _FailingConnection(db._conn)
+
+        db.create_session("s1", "telegram")
+
+        assert db.get_session("s1") is not None
+
+    def test_write_does_not_replay_after_transaction_starts(self, db):
+        db._conn = _FailingConnection(
+            db._conn,
+            fail_sql="INSERT OR IGNORE INTO sessions",
+        )
+
+        with pytest.raises(sqlite3.DatabaseError, match="database disk image is malformed"):
+            db.create_session("s1", "telegram")
+
+        db.create_session("s2", "telegram")
+        assert db.get_session("s1") is None
+        assert db.get_session("s2") is not None
+
 
 class TestSessionLifecycle:
     def test_create_and_get_session(self, db):
@@ -2831,15 +2881,16 @@ class TestConcurrentWriteSafety:
         assert len(msgs) == 1
         assert msgs[0]["content"] == "hello after lock"
 
-    def test_sqlite_timeout_is_at_least_30s(self, db):
-        """Connection timeout should be >= 30s to survive CLI/gateway contention."""
+    def test_sqlite_timeout_stays_short_for_application_retries(self, db):
+        """Connection timeout stays short because writes retry with jitter."""
         # Access the underlying connection timeout via sqlite3 introspection.
         # There is no public API, so we check the kwarg via the module default.
         import inspect
         from hermes_state import SessionDB as _SessionDB
-        src = inspect.getsource(_SessionDB.__init__)
-        assert "30" in src, (
-            "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
+        src = inspect.getsource(_SessionDB._open_connection)
+        assert "timeout=1.0" in src, (
+            "SQLite timeout should stay short so application-level jitter retries "
+            "handle CLI/gateway lock contention"
         )
 
 
