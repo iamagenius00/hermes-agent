@@ -2242,6 +2242,31 @@ def run_conversation(
                     classified.should_rotate_credential, classified.should_fallback,
                 )
 
+                if getattr(api_error, "no_outer_retry", False):
+                    _summary = agent._summarize_api_error(api_error)
+                    agent._flush_status_buffer()
+                    agent._emit_status(f"❌ Provider stream stalled — {_summary}")
+                    logger.error(
+                        "%sProvider stream stalled without first event; "
+                        "not replaying through outer API retries. provider=%s "
+                        "model=%s msgs=%s tokens=~%s error=%s",
+                        agent.log_prefix,
+                        getattr(agent, "provider", "unknown"),
+                        getattr(agent, "model", "unknown"),
+                        len(api_messages) if api_messages else 0,
+                        f"{approx_tokens:,}",
+                        _summary,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": f"Provider stream stalled: {_summary}",
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _summary,
+                    }
+
                 if (
                     classified.reason == FailoverReason.billing
                     and _is_nous_inference_route(

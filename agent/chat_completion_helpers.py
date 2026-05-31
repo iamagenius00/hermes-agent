@@ -39,6 +39,19 @@ from utils import base_url_host_matches, base_url_hostname
 logger = logging.getLogger(__name__)
 
 
+class StreamStalledError(TimeoutError):
+    """Raised when the stream watchdog aborts a request before any event arrives.
+
+    Generic transport retries make a silent provider hang much worse: a
+    180-second no-byte stall becomes 9+ minutes when both the stream retry loop
+    and the outer API retry loop replay the same request. Mark this exception
+    so the conversation loop can surface a bounded, actionable failure instead
+    of compounding retries.
+    """
+
+    no_outer_retry = True
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -1625,6 +1638,52 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     result = {"response": None, "error": None, "partial_tool_names": []}
     request_client_holder = {"client": None, "diag": None, "owner_tid": None}
     request_client_lock = threading.Lock()
+    silent_stale_attempts: set[int] = set()
+    current_stream_attempt = {"i": 0}
+
+    def _close_anthropic_request_client(client, *, reason: str) -> None:
+        if client is None:
+            return
+        force_closed = 0
+        try:
+            force_closed = agent._force_close_tcp_sockets(client)
+        except Exception:
+            pass
+        try:
+            client.close()
+            logger.info(
+                "Anthropic client closed (%s, tcp_force_closed=%d) %s",
+                reason,
+                force_closed,
+                agent._client_log_context(),
+            )
+        except Exception as exc:
+            logger.debug(
+                "Anthropic client close failed (%s) %s error=%s",
+                reason,
+                agent._client_log_context(),
+                exc,
+            )
+
+    def _abort_anthropic_request_client(client, *, reason: str) -> None:
+        if client is None:
+            return
+        try:
+            shutdown_count = agent._force_close_tcp_sockets(client)
+            logger.info(
+                "Anthropic client aborted (%s, tcp_force_closed=%d, "
+                "deferred_close=stranger_thread) %s",
+                reason,
+                shutdown_count,
+                agent._client_log_context(),
+            )
+        except Exception as exc:
+            logger.debug(
+                "Anthropic client abort failed (%s) %s error=%s",
+                reason,
+                agent._client_log_context(),
+                exc,
+            )
 
     def _set_request_client(client):
         with request_client_lock:
@@ -1651,7 +1710,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 request_client_holder["owner_tid"] = None
         if request_client is None:
             return
-        if stranger_thread:
+        if agent.api_mode == "anthropic_messages":
+            if stranger_thread:
+                _abort_anthropic_request_client(request_client, reason=reason)
+            else:
+                _close_anthropic_request_client(request_client, reason=reason)
+        elif stranger_thread:
             agent._abort_request_openai_client(request_client, reason=reason)
         else:
             agent._close_request_openai_client(request_client, reason=reason)
@@ -1973,8 +2037,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Per-attempt diagnostic dict for the retry block to consume.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
+        request_client = _set_request_client(agent._anthropic_client)
         # Use the Anthropic SDK's streaming context manager
-        with agent._anthropic_client.messages.stream(**api_kwargs) as stream:
+        with request_client.messages.stream(**api_kwargs) as stream:
             # The Anthropic SDK exposes the raw httpx response on
             # ``stream.response``.  Snapshot diagnostic headers
             # immediately so they survive a stream that dies before the
@@ -2047,6 +2112,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
+                current_stream_attempt["i"] = _stream_attempt
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
                 # but the retry loop opens a FRESH connection — negating the
@@ -2063,6 +2129,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_chat_completions()
                     return  # success
                 except Exception as e:
+                    _silent_stale_watchdog_error = (
+                        _stream_attempt in silent_stale_attempts
+                    )
+                    if _silent_stale_watchdog_error:
+                        _silent_stale_retries_raw = os.getenv(
+                            "HERMES_STREAM_SILENT_STALE_RETRIES",
+                            os.getenv("HERMES_STREAM_STALE_RETRIES", "0"),
+                        )
+                        try:
+                            _silent_stale_retries = int(_silent_stale_retries_raw)
+                        except (TypeError, ValueError):
+                            _silent_stale_retries = 0
+                        if _stream_attempt >= max(0, _silent_stale_retries):
+                            _est_ctx = estimate_request_context_tokens(api_kwargs)
+                            result["error"] = StreamStalledError(
+                                "Provider stream produced no events before the "
+                                f"{int(_stream_stale_timeout)}s watchdog fired "
+                                f"(model: {api_kwargs.get('model', 'unknown')}, "
+                                f"context: ~{_est_ctx:,} tokens)."
+                            )
+                            return
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                     )
@@ -2167,12 +2254,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             diag=request_client_holder.get("diag"),
                         )
                         _close_request_client_once("stream_mid_tool_retry_cleanup")
-                        try:
-                            agent._replace_primary_openai_client(
-                                reason="stream_mid_tool_retry_pool_cleanup"
-                            )
-                        except Exception:
-                            pass
+                        if agent.api_mode == "anthropic_messages":
+                            try:
+                                agent._rebuild_anthropic_client()
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                agent._replace_primary_openai_client(
+                                    reason="stream_mid_tool_retry_pool_cleanup"
+                                )
+                            except Exception:
+                                pass
                         continue
 
                     # SSE error events from proxies (e.g. OpenRouter sends
@@ -2220,12 +2313,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             _close_request_client_once("stream_retry_cleanup")
                             # Also rebuild the primary client to purge
                             # any dead connections from the pool.
-                            try:
-                                agent._replace_primary_openai_client(
-                                    reason="stream_retry_pool_cleanup"
-                                )
-                            except Exception:
-                                pass
+                            if agent.api_mode == "anthropic_messages":
+                                try:
+                                    agent._rebuild_anthropic_client()
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    agent._replace_primary_openai_client(
+                                        reason="stream_retry_pool_cleanup"
+                                    )
+                                except Exception:
+                                    pass
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,
@@ -2342,6 +2441,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _stale_elapsed = time.time() - last_chunk_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
+            _diag = request_client_holder.get("diag")
+            _chunks = 0
+            if isinstance(_diag, dict):
+                try:
+                    _chunks = int(_diag.get("chunks") or 0)
+                except Exception:
+                    _chunks = 0
+            if _chunks <= 0:
+                silent_stale_attempts.add(current_stream_attempt["i"])
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
                 "model=%s context=~%s tokens. Killing connection.",
@@ -2360,10 +2468,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pass
             # Rebuild the primary client too — its connection pool
             # may hold dead sockets from the same provider outage.
-            try:
-                agent._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
-            except Exception:
-                pass
+            if agent.api_mode == "anthropic_messages":
+                try:
+                    agent._rebuild_anthropic_client()
+                except Exception:
+                    pass
+            else:
+                try:
+                    agent._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
+                except Exception:
+                    pass
             # Reset the timer so we don't kill repeatedly while
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
@@ -2374,7 +2488,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if agent._interrupt_requested:
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
+                    _close_request_client_once("stream_interrupt_abort")
                     agent._rebuild_anthropic_client()
                 else:
                     _close_request_client_once("stream_interrupt_abort")
@@ -2454,4 +2568,5 @@ __all__ = [
     "handle_max_iterations",
     "cleanup_task_resources",
     "interruptible_streaming_api_call",
+    "StreamStalledError",
 ]

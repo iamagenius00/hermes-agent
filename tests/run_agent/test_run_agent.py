@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import re
+import threading
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -5412,6 +5413,94 @@ class TestStreamingApiCall:
 
         assert resp.choices[0].message.content == "Hello"
         assert resp.model == "gpt-4"
+
+    def test_anthropic_silent_stale_aborts_original_stream_client(self, agent, monkeypatch):
+        """A stale Anthropic stream must abort the client that owns the live socket.
+
+        Regression: the watchdog closed ``agent._anthropic_client``. If the
+        shared attribute was rebuilt while the worker still blocked in the old
+        stream, later watchdog ticks closed the fresh idle client and left the
+        original socket wedged until the SDK read timeout.
+        """
+        import httpx
+        from agent.chat_completion_helpers import StreamStalledError
+
+        abort_event = threading.Event()
+        forced_clients = []
+
+        class BlockingStream:
+            response = SimpleNamespace(headers={}, status_code=200)
+
+            def __enter__(self):
+                # Simulate the shared Anthropic client being rebuilt after the
+                # stream starts. The watchdog must still abort old_client.
+                agent._anthropic_client = new_client
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if not abort_event.wait(1.0):
+                    raise AssertionError("stale watchdog did not abort the live client")
+                raise httpx.ReadTimeout("aborted by test")
+
+            def get_final_message(self):
+                raise AssertionError("stream should not complete")
+
+        class FakeMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def stream(self, **kwargs):
+                self.calls += 1
+                return BlockingStream()
+
+        class FakeClient:
+            def __init__(self, name):
+                self.name = name
+                self.messages = FakeMessages()
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        old_client = FakeClient("old")
+        new_client = FakeClient("new")
+
+        def force_close(client):
+            forced_clients.append(client)
+            if client is old_client:
+                abort_event.set()
+            return 1
+
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent.model = "claude-test"
+        agent.base_url = "https://api.anthropic.com"
+        agent._anthropic_client = old_client
+        agent._try_refresh_anthropic_client_credentials = MagicMock(return_value=False)
+        agent._force_close_tcp_sockets = force_close
+        agent._rebuild_anthropic_client = MagicMock(
+            side_effect=lambda: setattr(agent, "_anthropic_client", new_client)
+        )
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.01")
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+        monkeypatch.delenv("HERMES_STREAM_SILENT_STALE_RETRIES", raising=False)
+        monkeypatch.delenv("HERMES_STREAM_STALE_RETRIES", raising=False)
+
+        with pytest.raises(StreamStalledError):
+            agent._interruptible_streaming_api_call(
+                {"messages": [], "model": "claude-test"}
+            )
+
+        assert old_client.messages.calls == 1
+        assert old_client in forced_clients
+        assert new_client not in forced_clients
+        assert old_client.closed is True
 
 
 # ===================================================================
